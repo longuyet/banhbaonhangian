@@ -394,7 +394,7 @@ function renderGrid(containerId, list, emptyMsg) {
 }
 
 /* ---------- TRANG CHI TIẾT SÁCH ---------- */
-function openBook(bookId) {
+async function openBook(bookId) {
   var b = STATE.books.filter(function (x) { return x.id === bookId; })[0];
   if (!b) return;
   STATE.book = b;
@@ -403,7 +403,10 @@ function openBook(bookId) {
   view.innerHTML = '<div class="loading"><div class="spinner"></div>Đang tải chi tiết sách...</div>';
   showView('book');
 
-  call('bumpView', bookId).then(function (s) { if (s) b.views = s.views; renderBook(); });
+  call('bumpView', bookId).then(function (s) { 
+    if (s) b.views = s.views; 
+    renderBook(); 
+  });
   
   var cachedCh = sessionStorage.getItem('sn_ch_' + bookId);
   if (cachedCh) {
@@ -413,12 +416,18 @@ function openBook(bookId) {
     } catch(e){}
   }
 
-  call('getChapters', bookId).then(function (res) {
-    STATE.chapters = res.chapters || [];
-    sessionStorage.setItem('sn_ch_' + bookId, JSON.stringify(STATE.chapters));
-    if (res.error) toast(res.error);
-    renderBook();
-  }).catch(function (e) { toast('Lỗi đọc nội dung Google Doc: ' + e.message); });
+  try {
+    var res = await call('getChapters', bookId);
+    if (res && res.chapters) {
+      STATE.chapters = res.chapters;
+      sessionStorage.setItem('sn_ch_' + bookId, JSON.stringify(STATE.chapters));
+      if (res.error) toast(res.error);
+    } else if (res && res.error) {
+      toast(res.error);
+    }
+  } catch (e) {
+    toast('Lỗi đọc nội dung Google Doc: ' + e.message);
+  }
 
   renderBook();
 }
