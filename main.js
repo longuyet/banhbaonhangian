@@ -41,6 +41,17 @@ async function call(fn) {
   return resData.data;
 }
 
+/* ---------- GỌI CÓ TỰ ĐỘNG THỬ LẠI ----------*/
+async function callSafe(fn) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  try {
+    return await call.apply(null, [fn].concat(args));
+  } catch (e) {
+    await new Promise(function (resolve) { setTimeout(resolve, 900); });
+    return call.apply(null, [fn].concat(args));
+  }
+}
+
 function toast(msg) {
   var t = document.getElementById('toast');
   t.textContent = msg;
@@ -84,21 +95,43 @@ var STATE = {
 
 /* ---------- KHỞI ĐỘNG ---------- */
 window.addEventListener('DOMContentLoaded', function () {
-  call('getSiteConfig').then(function (cfg) {
-    document.getElementById('brandName').textContent = cfg.siteName;
-    document.title = cfg.siteName;
-  });
-
-  call('getMyLikes').then(function (m) { STATE.myLikes = m || {}; });
-  call('getMyCommentLikes').then(function (m) { STATE.myCommentLikes = m || {}; });
-
   initSecurity();
   initNav();
   initSearch();
   initSparkles();
-  
-  loadBooks();
-  loadFaq();
+
+  // Hiện ngay danh sách sách từ cache trình duyệt (nếu có) trong lúc chờ server phản hồi
+  var localCache = sessionStorage.getItem('sn_books');
+  if (localCache) {
+    try {
+      STATE.books = JSON.parse(localCache);
+      renderAllBookGrids();
+    } catch (e) {}
+  }
+
+  callSafe('bootstrap').then(function (data) {
+    if (!data) return;
+    if (data.siteName) {
+      document.getElementById('brandName').textContent = data.siteName;
+      document.title = data.siteName;
+    }
+    STATE.myLikes = data.myLikes || {};
+    STATE.myCommentLikes = data.myCommentLikes || {};
+    STATE.books = data.books || STATE.books;
+    sessionStorage.setItem('sn_books', JSON.stringify(STATE.books));
+    renderAllBookGrids();
+    renderFaq(data.faq || []);
+  }).catch(function () {
+    // Bootstrap lỗi cả 2 lần: rơi về gọi từng lệnh riêng để trang vẫn hoạt động được
+    call('getSiteConfig').then(function (cfg) {
+      document.getElementById('brandName').textContent = cfg.siteName;
+      document.title = cfg.siteName;
+    }).catch(function () {});
+    call('getMyLikes').then(function (m) { STATE.myLikes = m || {}; }).catch(function () {});
+    call('getMyCommentLikes').then(function (m) { STATE.myCommentLikes = m || {}; }).catch(function () {});
+    loadBooks();
+    loadFaq();
+  });
 });
 
 /* ---------- CẤM CHUỘT PHẢI VÀ F12 ---------- */
@@ -403,11 +436,11 @@ async function openBook(bookId) {
   view.innerHTML = '<div class="loading"><div class="spinner"></div>Đang tải chi tiết sách...</div>';
   showView('book');
 
-  call('bumpView', bookId).then(function (s) { 
-    if (s) b.views = s.views; 
-    renderBook(); 
-  });
-  
+  call('bumpView', bookId).then(function (s) {
+    if (s) b.views = s.views;
+    renderBook();
+  }).catch(function () {});
+
   var cachedCh = sessionStorage.getItem('sn_ch_' + bookId);
   if (cachedCh) {
     try {
@@ -417,7 +450,8 @@ async function openBook(bookId) {
   }
 
   try {
-    var res = await call('getChapters', bookId);
+    // getChapters chỉ ĐỌC dữ liệu nên dùng callSafe để tự thử lại nếu lần đầu lỗi
+    var res = await callSafe('getChapters', bookId);
     if (res && res.chapters) {
       STATE.chapters = res.chapters;
       sessionStorage.setItem('sn_ch_' + bookId, JSON.stringify(STATE.chapters));
@@ -825,15 +859,21 @@ function updateLikeCount(list, id, likes) {
 /* ---------- FAQ ---------- */
 function loadFaq() {
   call('getFaq').then(function (faqs) {
-    var box = document.getElementById('faq-list');
-    if (!faqs || !faqs.length) { box.innerHTML = '<div class="empty">Chưa có câu hỏi nào.</div>'; return; }
-    box.innerHTML = faqs.map(function (f, i) {
-      return '<div class="faq-item" id="faq-' + i + '">' +
-        '<button class="faq-q" onclick="document.getElementById(\'faq-' + i + '\').classList.toggle(\'open\')">' +
-          '<span>' + f.q + '</span>' +
-          '<svg class="icon chev" viewBox="0 0 24 24" style="width:16px;height:16px;stroke-width:3"><polyline points="6 9 12 15 18 9"/></svg>' +
-        '</button>' +
-        '<div class="faq-a"><div class="faq-a-inner">' + f.a + '</div></div></div>';
-    }).join('');
+    renderFaq(faqs);
+  }).catch(function () {
+    renderFaq([]);
   });
+}
+
+function renderFaq(faqs) {
+  var box = document.getElementById('faq-list');
+  if (!faqs || !faqs.length) { box.innerHTML = '<div class="empty">Chưa có câu hỏi nào.</div>'; return; }
+  box.innerHTML = faqs.map(function (f, i) {
+    return '<div class="faq-item" id="faq-' + i + '">' +
+      '<button class="faq-q" onclick="document.getElementById(\'faq-' + i + '\').classList.toggle(\'open\')">' +
+        '<span>' + f.q + '</span>' +
+        '<svg class="icon chev" viewBox="0 0 24 24" style="width:16px;height:16px;stroke-width:3"><polyline points="6 9 12 15 18 9"/></svg>' +
+      '</button>' +
+      '<div class="faq-a"><div class="faq-a-inner">' + f.a + '</div></div></div>';
+  }).join('');
 }
