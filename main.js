@@ -877,3 +877,381 @@ function renderFaq(faqs) {
       '<div class="faq-a"><div class="faq-a-inner">' + f.a + '</div></div></div>';
   }).join('');
 }
+
+/* =========================================================
+   AUDIO ĐỌC TRUYỆN (Web Speech API)
+   - Nút tai nghe ở thanh chương -> hiện thanh phát nhạc nổi
+   - Highlight đoạn đang đọc, tự cuộn theo
+   - Hết chương tự chuyển chương sau
+   - Tạm dừng / đoạn trước / đoạn sau / tốc độ / chọn giọng
+   ========================================================= */
+var TTS = {
+  supported: ('speechSynthesis' in window) && ('SpeechSynthesisUtterance' in window),
+  active: false,
+  paused: false,
+  idx: 0,
+  ci: 0,
+  chunks: [],
+  token: 0,
+  utter: null,
+  autoNext: false,
+  rate: 1,
+  voiceURI: '',
+  voices: [],
+  warnedNoVi: false
+};
+try {
+  TTS.rate = parseFloat(localStorage.getItem('tts_rate')) || 1;
+  TTS.voiceURI = localStorage.getItem('tts_voice') || '';
+} catch (e) {}
+
+var TTS_ICON = {
+  play: '<svg class="icon" viewBox="0 0 24 24" style="fill:currentColor"><polygon points="7 4 20 12 7 20"/></svg>',
+  pause: '<svg class="icon" viewBox="0 0 24 24" style="stroke-width:3.6"><line x1="8" y1="5" x2="8" y2="19"/><line x1="16" y1="5" x2="16" y2="19"/></svg>',
+  prev: '<svg class="icon" viewBox="0 0 24 24"><polygon points="19 20 9 12 19 4"/><line x1="5" y1="19" x2="5" y2="5"/></svg>',
+  next: '<svg class="icon" viewBox="0 0 24 24"><polygon points="5 4 15 12 5 20"/><line x1="19" y1="5" x2="19" y2="19"/></svg>',
+  close: '<svg class="icon" viewBox="0 0 24 24"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+  head: '<svg class="icon" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>'
+};
+
+/* ---------- Giọng đọc ---------- */
+function ttsLoadVoices() {
+  if (!TTS.supported) return;
+  var all = speechSynthesis.getVoices() || [];
+  var vi = all.filter(function (v) { return /^vi([-_]|$)/i.test(v.lang); });
+  vi.sort(function (a, b) {
+    return (/natural|online/i.test(b.name) ? 1 : 0) - (/natural|online/i.test(a.name) ? 1 : 0);
+  });
+  TTS.voices = vi;
+  var sel = document.getElementById('ttsVoice');
+  if (!sel) return;
+  if (!vi.length) {
+    sel.innerHTML = '<option value="">Mặc định của thiết bị</option>';
+    return;
+  }
+  sel.innerHTML = vi.map(function (v) {
+    return '<option value="' + esc(v.voiceURI) + '">' + esc(v.name) + '</option>';
+  }).join('');
+  var saved = vi.filter(function (v) { return v.voiceURI === TTS.voiceURI; })[0];
+  sel.value = (saved || vi[0]).voiceURI;
+}
+
+function ttsPickVoice() {
+  var v = TTS.voices.filter(function (x) { return x.voiceURI === TTS.voiceURI; })[0];
+  return v || TTS.voices[0] || null;
+}
+
+/* ---------- Lấy chữ & chia nhỏ để đọc ---------- */
+function ttsParas() {
+  return document.querySelectorAll('#readerBody .para');
+}
+
+function ttsParaText(el) {
+  var c = el.cloneNode(true);
+  var badges = c.querySelectorAll('.comment-badge');
+  for (var i = 0; i < badges.length; i++) badges[i].remove();
+  var t = (c.textContent || '').replace(/^\s*•\s*/, '');
+  t = t.replace(/[\u{10000}-\u{10FFFF}]/gu, ' ').replace(/[^\p{L}\p{M}\p{N}\p{P}\p{Zs}]/gu, ' ').replace(/\s+/g, ' ').trim();
+  return /[\p{L}\p{N}]/u.test(t) ? t : '';
+}
+
+function ttsChunks(text) {
+  if (!text) return [];
+  var sents = text.match(/.+?(?:[.!?…]+["”’')\]]*(?=\s|$)|$)/g) || [text];
+  var out = [], cur = '';
+  sents.forEach(function (s) {
+    s = s.trim();
+    if (!s) return;
+    if (cur && (cur.length + s.length + 1) > 140) { out.push(cur); cur = s; }
+    else { cur = cur ? cur + ' ' + s : s; }
+  });
+  if (cur) out.push(cur);
+
+  var res = [];
+  out.forEach(function (c) {
+    while (c.length > 200) {
+      var cut = Math.max(c.lastIndexOf(',', 160), c.lastIndexOf(' ', 160));
+      if (cut < 60) cut = 160;
+      res.push(c.slice(0, cut + 1).trim());
+      c = c.slice(cut + 1).trim();
+    }
+    if (c) res.push(c);
+  });
+  return res;
+}
+
+/* ---------- Highlight ---------- */
+function ttsMark(i) {
+  var paras = ttsParas();
+  for (var k = 0; k < paras.length; k++) paras[k].classList.remove('tts-active');
+  var el = paras[i];
+  if (!el) return;
+  el.classList.add('tts-active');
+  var r = el.getBoundingClientRect();
+  if (r.top < 100 || r.bottom > window.innerHeight - 110) {
+    var tall = r.height > window.innerHeight - 260;
+    el.scrollIntoView({ behavior: 'smooth', block: tall ? 'start' : 'center' });
+  }
+}
+
+function ttsUnmark() {
+  var paras = ttsParas();
+  for (var k = 0; k < paras.length; k++) paras[k].classList.remove('tts-active');
+}
+
+/* ---------- Phát ---------- */
+function ttsStartAt(i, ci) {
+  var paras = ttsParas();
+  if (!paras.length) return;
+  i = Math.max(0, Math.min(i, paras.length - 1));
+  var myToken = ++TTS.token;
+  try { speechSynthesis.cancel(); } catch (e) {}
+  TTS.active = true;
+  TTS.paused = false;
+  TTS.idx = i;
+  TTS.chunks = ttsChunks(ttsParaText(paras[i]));
+  TTS.ci = ci || 0;
+  ttsMark(i);
+  ttsRefresh();
+  if (!TTS.chunks.length) {
+    setTimeout(function () { ttsAdvance(myToken); }, 0);
+    return;
+  }
+  setTimeout(function () { ttsSpeak(myToken); }, 60);
+}
+
+function ttsSpeak(token) {
+  if (token !== TTS.token) return;
+  if (TTS.ci >= TTS.chunks.length) { ttsAdvance(token); return; }
+  var u = new SpeechSynthesisUtterance(TTS.chunks[TTS.ci]);
+  u.lang = 'vi-VN';
+  u.rate = TTS.rate;
+  var v = ttsPickVoice();
+  if (v) { u.voice = v; u.lang = v.lang; }
+  u.onend = function () {
+    if (token !== TTS.token) return;
+    TTS.ci++;
+    ttsSpeak(token);
+  };
+  u.onerror = function (e) {
+    if (token !== TTS.token) return;
+    var err = e && e.error;
+    if (err === 'interrupted' || err === 'canceled') return;
+    if (err === 'not-allowed' || err === 'synthesis-unavailable' || err === 'language-unavailable' || err === 'audio-busy') {
+      toast('Không đọc được audio trên thiết bị này rồi (┬┬﹏┬┬)');
+      ttsStop();
+      return;
+    }
+    TTS.ci++;
+    ttsSpeak(token);
+  };
+  TTS.utter = u;
+  speechSynthesis.speak(u);
+}
+
+function ttsAdvance(token) {
+  if (token !== TTS.token) return;
+  var paras = ttsParas();
+  if (TTS.idx + 1 < paras.length) { ttsStartAt(TTS.idx + 1); return; }
+  ttsNextChapter();
+}
+
+function ttsNextChapter() {
+  if (STATE.chapterIdx + 1 < STATE.chapters.length) {
+    toast('Hết chương rồi, đọc tiếp chương sau nha ♡');
+    TTS.autoNext = true;
+    try { openChapter(STATE.chapterIdx + 1); } finally { TTS.autoNext = false; }
+    window.scrollTo(0, 0);
+    ttsStartAt(0);
+  } else {
+    toast('Đã hết truyện rồi, cảm ơn bạn đã nghe nha ♡');
+    ttsStop();
+  }
+}
+
+function ttsPause() {
+  if (!TTS.active || TTS.paused) return;
+  TTS.token++;
+  try { speechSynthesis.cancel(); } catch (e) {}
+  TTS.paused = true;
+  ttsRefresh();
+}
+
+function ttsResume() {
+  if (!TTS.active || !TTS.paused) return;
+  ttsStartAt(TTS.idx, TTS.ci);
+}
+
+function ttsPlayPause() {
+  if (!TTS.active) return;
+  if (TTS.paused) ttsResume(); else ttsPause();
+}
+
+function ttsSkip(delta) {
+  if (!TTS.active) return;
+  var paras = ttsParas();
+  var ni = TTS.idx + delta;
+  if (ni < 0) ni = 0;
+  if (ni >= paras.length) { ttsNextChapter(); return; }
+  if (TTS.paused) {
+    TTS.token++;
+    TTS.idx = ni;
+    TTS.ci = 0;
+    ttsMark(ni);
+    ttsRefresh();
+  } else {
+    ttsStartAt(ni);
+  }
+}
+
+function ttsStop() {
+  TTS.token++;
+  try { speechSynthesis.cancel(); } catch (e) {}
+  TTS.active = false;
+  TTS.paused = false;
+  ttsUnmark();
+  ttsRefresh();
+}
+
+function ttsFirstVisible() {
+  var paras = ttsParas();
+  for (var i = 0; i < paras.length; i++) {
+    if (paras[i].getBoundingClientRect().bottom > 120) return i;
+  }
+  return 0;
+}
+
+function ttsToggleAudio() {
+  if (!TTS.supported) {
+    toast('Trình duyệt này chưa hỗ trợ đọc audio, thử Chrome / Edge / Safari nha');
+    return;
+  }
+  if (TTS.active) { ttsStop(); return; }
+  if (!TTS.voices.length) ttsLoadVoices();
+  if (!TTS.voices.length && !TTS.warnedNoVi) {
+    TTS.warnedNoVi = true;
+    toast('Thiết bị chưa có giọng tiếng Việt, mình dùng giọng mặc định nha');
+  }
+  ttsStartAt(ttsFirstVisible());
+}
+
+/* ---------- Giao diện ---------- */
+function ttsRefresh() {
+  var player = document.getElementById('ttsPlayer');
+  if (!player) return;
+  player.classList.toggle('show', TTS.active);
+  document.body.classList.toggle('has-tts', TTS.active);
+
+  var playing = TTS.active && !TTS.paused;
+  var playBtn = document.getElementById('ttsPlay');
+  playBtn.innerHTML = playing ? TTS_ICON.pause : TTS_ICON.play;
+  playBtn.setAttribute('aria-label', playing ? 'Tạm dừng' : 'Phát');
+  playBtn.title = playing ? 'Tạm dừng' : 'Phát';
+
+  var h = document.querySelector('#view-chapter .chapter-heading');
+  document.getElementById('ttsTitle').textContent = h ? h.textContent : 'Audio';
+  document.getElementById('ttsPos').textContent = 'Đoạn ' + (TTS.idx + 1) + '/' + ttsParas().length + (TTS.paused ? ' · đang tạm dừng' : '');
+  document.getElementById('ttsSet').textContent = TTS.rate.toFixed(1) + 'x';
+
+  var ob = document.getElementById('ttsOpenBtn');
+  if (ob) ob.classList.toggle('tts-on', TTS.active);
+}
+
+function ttsInjectButton() {
+  if (!TTS.supported) return;
+  var nav = document.querySelector('#view-chapter .reader-topbar .nav-controls');
+  if (!nav || nav.querySelector('#ttsOpenBtn')) return;
+  var b = document.createElement('button');
+  b.type = 'button';
+  b.id = 'ttsOpenBtn';
+  b.className = 'nav-btn' + (TTS.active ? ' tts-on' : '');
+  b.title = 'Nghe audio';
+  b.setAttribute('aria-label', 'Nghe audio');
+  b.innerHTML = TTS_ICON.head;
+  b.onclick = ttsToggleAudio;
+  var flag = nav.querySelector('button[aria-label="Báo lỗi chương này"]');
+  if (flag) nav.insertBefore(b, flag); else nav.appendChild(b);
+  ttsRefresh();
+}
+
+function ttsInit() {
+  if (!TTS.supported || document.getElementById('ttsPlayer')) return;
+  var el = document.createElement('div');
+  el.id = 'ttsPlayer';
+  el.className = 'tts-player';
+  el.setAttribute('role', 'region');
+  el.setAttribute('aria-label', 'Trình đọc audio');
+  el.innerHTML =
+    '<div class="tts-panel" id="ttsPanel">' +
+      '<label><span>Tốc độ</span><input type="range" id="ttsRate" min="0.6" max="1.8" step="0.1" value="' + TTS.rate + '"></label>' +
+      '<label><span>Giọng đọc</span><select id="ttsVoice"></select></label>' +
+    '</div>' +
+    '<div class="tts-bar">' +
+      '<button type="button" class="tts-btn" id="ttsPrev" title="Đoạn trước" aria-label="Đoạn trước">' + TTS_ICON.prev + '</button>' +
+      '<button type="button" class="tts-btn tts-main" id="ttsPlay" title="Phát" aria-label="Phát">' + TTS_ICON.play + '</button>' +
+      '<button type="button" class="tts-btn" id="ttsNext" title="Đoạn sau" aria-label="Đoạn sau">' + TTS_ICON.next + '</button>' +
+      '<div class="tts-info"><b id="ttsTitle">Audio</b><span id="ttsPos"></span></div>' +
+      '<button type="button" class="tts-speed" id="ttsSet" title="Tốc độ & giọng đọc">1.0x</button>' +
+      '<button type="button" class="tts-btn" id="ttsClose" title="Tắt audio" aria-label="Tắt audio">' + TTS_ICON.close + '</button>' +
+    '</div>';
+  document.body.appendChild(el);
+
+  document.getElementById('ttsPrev').onclick = function () { ttsSkip(-1); };
+  document.getElementById('ttsNext').onclick = function () { ttsSkip(1); };
+  document.getElementById('ttsPlay').onclick = ttsPlayPause;
+  document.getElementById('ttsClose').onclick = function () {
+    document.getElementById('ttsPanel').classList.remove('open');
+    ttsStop();
+  };
+  document.getElementById('ttsSet').onclick = function () {
+    document.getElementById('ttsPanel').classList.toggle('open');
+  };
+
+  var rateInput = document.getElementById('ttsRate');
+  rateInput.oninput = function () {
+    TTS.rate = parseFloat(rateInput.value) || 1;
+    document.getElementById('ttsSet').textContent = TTS.rate.toFixed(1) + 'x';
+  };
+  rateInput.onchange = function () {
+    try { localStorage.setItem('tts_rate', String(TTS.rate)); } catch (e) {}
+    if (TTS.active && !TTS.paused) ttsStartAt(TTS.idx, TTS.ci);
+  };
+  document.getElementById('ttsVoice').onchange = function () {
+    TTS.voiceURI = this.value;
+    try { localStorage.setItem('tts_voice', TTS.voiceURI); } catch (e) {}
+    if (TTS.active && !TTS.paused) ttsStartAt(TTS.idx, TTS.ci);
+  };
+
+  ttsLoadVoices();
+  try { speechSynthesis.onvoiceschanged = ttsLoadVoices; } catch (e) {}
+  window.addEventListener('beforeunload', function () {
+    try { speechSynthesis.cancel(); } catch (e) {}
+  });
+  ttsRefresh();
+}
+
+/* ---------- Gắn vào openChapter / showView có sẵn ---------- */
+(function ttsPatch() {
+  var _open = window.openChapter, _show = window.showView;
+
+  if (typeof _open === 'function') {
+    window.openChapter = function () {
+      var keepPlaying = TTS.active && !TTS.paused && !TTS.autoNext;
+      if (TTS.active && !TTS.autoNext) ttsStop();
+      var r = _open.apply(this, arguments);
+      ttsInjectButton();
+      if (keepPlaying) { window.scrollTo(0, 0); ttsStartAt(0); }
+      return r;
+    };
+  }
+
+  if (typeof _show === 'function') {
+    window.showView = function (id) {
+      if (id !== 'chapter' && TTS.active) ttsStop();
+      return _show.apply(this, arguments);
+    };
+  }
+})();
+
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ttsInit);
+else ttsInit();
