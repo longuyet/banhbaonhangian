@@ -1236,6 +1236,7 @@ function ttsInit() {
 
   if (typeof _open === 'function') {
     window.openChapter = function () {
+      // đang nghe mà người dùng tự bấm đổi chương -> nghe tiếp từ đầu chương mới
       var keepPlaying = TTS.active && !TTS.paused && !TTS.autoNext;
       if (TTS.active && !TTS.autoNext) ttsStop();
       var r = _open.apply(this, arguments);
@@ -1255,3 +1256,179 @@ function ttsInit() {
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ttsInit);
 else ttsInit();
+
+/* =========================================================
+   ĐỊNH TUYẾN: mỗi trang (sách / chương / FAQ...) có địa chỉ riêng
+   - Nút Quay lại / Tiến của trình duyệt chạy đúng
+   - Tải lại trang vẫn ở đúng sách + chương đang đọc
+   - Link dạng  .../#/book/<id>/<số chương>  gửi cho bạn bè được
+   ========================================================= */
+var ROUTE = { silent: false, seq: 0 };
+try { history.scrollRestoration = 'manual'; } catch (e) {}
+
+function routeIsGAS() {
+  return typeof google !== 'undefined' && google.script && google.script.run;
+}
+
+function silently(fn) {
+  var old = ROUTE.silent;
+  ROUTE.silent = true;
+  try { return fn(); } finally { ROUTE.silent = old; }
+}
+
+/* view hiện tại -> chuỗi route ('' = trang chủ, null = không lưu) */
+function routeOf(id) {
+  if (id === 'search') return null;
+  if (id === 'home') return '';
+  if (id === 'book') return STATE.book ? 'book/' + encodeURIComponent(STATE.book.id) : null;
+  if (id === 'chapter') return STATE.book ? 'book/' + encodeURIComponent(STATE.book.id) + '/' + (STATE.chapterIdx + 1) : null;
+  return id;
+}
+
+/* chuỗi route -> {view, bookId, ch} */
+function routeParse(str) {
+  var s = String(str || '').replace(/^#?\/?/, '');
+  if (!s) return { view: 'home' };
+  var p = s.split('/');
+  try { p = p.map(decodeURIComponent); } catch (e) {}
+  if (p[0] === 'book' && p[1]) {
+    var n = parseInt(p[2], 10);
+    return { view: 'book', bookId: p[1], ch: (n > 0) ? n - 1 : null };
+  }
+  if (p[0] === 'book' || p[0] === 'chapter' || p[0] === 'search') return { view: 'home' };
+  if (!document.getElementById('view-' + p[0])) return { view: 'home' };
+  return { view: p[0] };
+}
+
+function routeMeta(id, route) {
+  try { sessionStorage.setItem('hochu_route', route || ''); } catch (e) {}
+  var brand = document.getElementById('brandName');
+  var site = brand ? brand.textContent : '';
+  var t = site;
+  if (STATE.book && (id === 'book' || id === 'chapter')) {
+    t = (STATE.book.titlePlain || '') + (site ? ' – ' + site : '');
+    var c = STATE.chapters && STATE.chapters[STATE.chapterIdx];
+    if (id === 'chapter' && c) t = c.label + ' · ' + t;
+  }
+  if (t) document.title = t;
+}
+
+function routePush(id) {
+  var route = routeOf(id);
+  if (route === null) return;
+  routeMeta(id, route);
+  if (ROUTE.silent) return;
+
+  var hash = '#/' + route;
+  var cur = location.hash || '#/';
+  if (cur === hash || (route === '' && (cur === '#' || cur === '#/'))) return;
+
+  // chương -> chương cùng sách: thay thế để nút Quay lại về thẳng trang sách
+  var replace = id === 'chapter' && /^#\/book\/[^/]+\/\d+$/.test(cur);
+  try {
+    if (replace) history.replaceState({ r: route }, '', hash);
+    else history.pushState({ r: route }, '', hash);
+  } catch (e) {
+    try { location.hash = hash; } catch (e2) {}
+  }
+}
+
+function routeWaitBook(id) {
+  return new Promise(function (resolve) {
+    var t0 = Date.now();
+    (function poll() {
+      var b = (STATE.books || []).filter(function (x) { return String(x.id) === String(id); })[0];
+      if (b) return resolve(b);
+      if (Date.now() - t0 > 25000) return resolve(null);
+      setTimeout(poll, 150);
+    })();
+  });
+}
+
+async function routeApply(r) {
+  var my = ++ROUTE.seq;
+  if (!r || r.view !== 'book') {
+    silently(function () { showView(r && r.view ? r.view : 'home'); });
+    return;
+  }
+
+  var same = STATE.book && String(STATE.book.id) === String(r.bookId);
+  if (!(same && STATE.chapters && STATE.chapters.length)) {
+    if (!same) {
+      document.getElementById('view-book').innerHTML =
+        '<div class="loading"><div class="spinner"></div>Đang tải...</div>';
+    }
+    silently(function () { showView('book'); });
+
+    var b = await routeWaitBook(r.bookId);
+    if (my !== ROUTE.seq) return;
+    if (!b) {
+      toast('Không tìm thấy truyện này');
+      silently(function () { showView('home'); });
+      return;
+    }
+    var hasCache = false;
+    try { hasCache = !!sessionStorage.getItem('sn_ch_' + b.id); } catch (e) {}
+    var p = silently(function () { return openBook(b.id); });
+    if (!(hasCache && r.ch != null)) {
+      await p;
+      if (my !== ROUTE.seq) return;
+    }
+  }
+
+  if (r.ch != null) {
+    silently(function () { openChapter(r.ch); });
+  } else {
+    silently(function () { renderBook(); showView('book'); });
+  }
+}
+
+function routeInit() {
+  var r = routeParse(location.hash);
+  // Apps Script chạy trong iframe nên không đọc được địa chỉ trên thanh trình duyệt:
+  // dùng bộ nhớ của tab để quay lại đúng chỗ khi tải lại
+  if (r.view === 'home' && routeIsGAS()) {
+    var saved = '';
+    try { saved = sessionStorage.getItem('hochu_route') || ''; } catch (e) {}
+    r = routeParse(saved);
+  }
+  if (r.view === 'home') return;
+
+  // Mở thẳng link chương: chèn trang sách vào lịch sử để Quay lại về trang sách
+  if (r.view === 'book' && r.ch != null && !(history.state && history.state.r !== undefined)) {
+    try {
+      var base = '#/book/' + encodeURIComponent(r.bookId);
+      history.replaceState({ r: 'book/' + encodeURIComponent(r.bookId) }, '', base);
+      history.pushState({ r: 'book/' + encodeURIComponent(r.bookId) + '/' + (r.ch + 1) }, '', base + '/' + (r.ch + 1));
+    } catch (e) {}
+  }
+  routeApply(r);
+}
+
+/* ---------- Gắn vào showView / call có sẵn ---------- */
+(function routePatch() {
+  var _show = window.showView;
+  if (typeof _show === 'function') {
+    window.showView = function (id) {
+      var res = _show.apply(this, arguments);
+      routePush(id);
+      return res;
+    };
+  }
+
+  // Khôi phục trang khi tải lại / Quay lại thì không tính thêm lượt xem
+  var _call = window.call;
+  if (typeof _call === 'function') {
+    window.call = function (fn) {
+      if (fn === 'bumpView' && ROUTE.silent) return Promise.resolve(null);
+      return _call.apply(this, arguments);
+    };
+  }
+
+  window.addEventListener('popstate', function () {
+    routeApply(routeParse(location.hash));
+  });
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', routeInit);
+  else routeInit();
+})();
