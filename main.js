@@ -1155,6 +1155,8 @@ function ttsRefresh() {
 
   var ob = document.getElementById('ttsOpenBtn');
   if (ob) ob.classList.toggle('tts-on', TTS.active);
+  var db = document.getElementById('dockAudio');
+  if (db) db.classList.toggle('tts-on', TTS.active);
 }
 
 function ttsInjectButton() {
@@ -1378,6 +1380,7 @@ async function routeApply(r) {
 
   if (r.ch != null) {
     silently(function () { openChapter(r.ch); });
+    scrollRestore(r.ch);
   } else {
     silently(function () { renderBook(); showView('book'); });
   }
@@ -1431,4 +1434,180 @@ function routeInit() {
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', routeInit);
   else routeInit();
+})();
+
+/* =========================================================
+   THANH ĐIỀU HƯỚNG NỔI + NHỚ VỊ TRÍ CUỘN
+   - Khi cuộn khỏi thanh trên/dưới của chương, thanh nổi hiện ở đáy màn hình:
+     chương trước / mục lục / chương sau / audio
+   - Nhớ vị trí đang đọc (theo đoạn) và khôi phục khi tải lại trang
+   ========================================================= */
+var DOCK = { raf: 0 };
+var SCROLLPOS = { lock: 0, timer: 0 };
+
+function dockHeaderH() {
+  var h = document.querySelector('header');
+  return h ? h.offsetHeight : 70;
+}
+
+function dockInit() {
+  if (document.getElementById('readerDock')) return;
+  var el = document.createElement('div');
+  el.id = 'readerDock';
+  el.className = 'reader-dock';
+  el.innerHTML =
+    '<div class="toc-menu" id="dockToc"></div>' +
+    '<div class="dock-bar">' +
+      '<button type="button" class="nav-btn" id="dockPrev" title="Chương trước" aria-label="Chương trước">' +
+        '<svg class="icon" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg></button>' +
+      '<button type="button" class="dock-label" id="dockLabel" title="Mục lục"></button>' +
+      '<button type="button" class="nav-btn" id="dockNext" title="Chương sau" aria-label="Chương sau">' +
+        '<svg class="icon" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg></button>' +
+      '<button type="button" class="nav-btn" id="dockAudio" title="Nghe audio" aria-label="Nghe audio"></button>' +
+    '</div>';
+  document.body.appendChild(el);
+
+  var audioBtn = document.getElementById('dockAudio');
+  if (typeof TTS !== 'undefined' && TTS.supported && typeof TTS_ICON !== 'undefined') {
+    audioBtn.innerHTML = TTS_ICON.head;
+    audioBtn.onclick = function () { ttsToggleAudio(); };
+  } else {
+    audioBtn.style.display = 'none';
+  }
+
+  document.getElementById('dockPrev').onclick = function () { openChapter(STATE.chapterIdx - 1); };
+  document.getElementById('dockNext').onclick = function () { openChapter(STATE.chapterIdx + 1); };
+  document.getElementById('dockLabel').onclick = function (e) {
+    e.stopPropagation();
+    document.getElementById('dockToc').classList.toggle('open');
+  };
+  document.getElementById('dockToc').onclick = function (e) {
+    var b = e.target.closest ? e.target.closest('button[data-i]') : null;
+    if (!b) return;
+    this.classList.remove('open');
+    openChapter(parseInt(b.getAttribute('data-i'), 10));
+  };
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest || !e.target.closest('#readerDock')) {
+      document.getElementById('dockToc').classList.remove('open');
+    }
+  });
+
+  window.addEventListener('scroll', function () {
+    dockSchedule();
+    clearTimeout(SCROLLPOS.timer);
+    SCROLLPOS.timer = setTimeout(scrollSave, 250);
+  }, { passive: true });
+  window.addEventListener('resize', dockSchedule);
+  window.addEventListener('pagehide', scrollSave);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') scrollSave();
+  });
+}
+
+function dockRender() {
+  var el = document.getElementById('readerDock');
+  var chs = STATE.chapters || [];
+  if (!el || !chs.length) return;
+  var idx = STATE.chapterIdx, c = chs[idx];
+  document.getElementById('dockLabel').textContent = c ? c.label : '';
+  document.getElementById('dockPrev').disabled = idx <= 0;
+  document.getElementById('dockNext').disabled = idx >= chs.length - 1;
+  document.getElementById('dockToc').innerHTML = chs.map(function (cc, i) {
+    return '<button type="button" data-i="' + i + '" class="' + (i === idx ? 'current' : '') + '">' +
+      esc(cc.label) + (cc.name ? ' - ' + esc(cc.name) : '') + '</button>';
+  }).join('');
+}
+
+function dockSchedule() {
+  if (DOCK.raf) return;
+  DOCK.raf = requestAnimationFrame(function () {
+    DOCK.raf = 0;
+    dockUpdate();
+  });
+}
+
+function dockUpdate() {
+  var el = document.getElementById('readerDock');
+  if (!el) return;
+  var view = document.getElementById('view-chapter');
+  var show = false;
+  if (view && view.classList.contains('active') && STATE.book && (STATE.chapters || []).length) {
+    var hh = dockHeaderH(), vh = window.innerHeight;
+    var top = view.querySelector('.reader-topbar');
+    var bot = view.querySelector('.bottom-nav-controls');
+    var topVisible = false, botVisible = false;
+    if (top) { var a = top.getBoundingClientRect(); topVisible = a.bottom > hh && a.top < vh; }
+    if (bot) { var b = bot.getBoundingClientRect(); botVisible = b.bottom > 0 && b.top < vh; }
+    show = !topVisible && !botVisible;
+  }
+  el.classList.toggle('show', show);
+  if (!show) document.getElementById('dockToc').classList.remove('open');
+}
+
+/* ---------- Nhớ vị trí cuộn ---------- */
+function scrollKey() {
+  return STATE.book ? 'hochu_scroll_' + STATE.book.id : null;
+}
+
+function scrollSave() {
+  if (Date.now() < SCROLLPOS.lock) return;
+  var view = document.getElementById('view-chapter');
+  var key = scrollKey();
+  if (!key || !view || !view.classList.contains('active')) return;
+  var paras = document.querySelectorAll('#readerBody .para');
+  if (!paras.length) return;
+
+  var line = dockHeaderH() + 12, found = -1, off = 0, i, r;
+  for (i = 0; i < paras.length; i++) {
+    r = paras[i].getBoundingClientRect();
+    if (r.bottom > line) { found = i; off = Math.round(line - r.top); break; }
+  }
+  if (found === -1) {   // đã cuộn qua hết phần chữ (đang ở khu bình luận)
+    found = paras.length - 1;
+    off = Math.round(line - paras[found].getBoundingClientRect().top);
+  }
+  if (found === 0 && off < 0) { found = -1; off = 0; }   // còn ở đầu trang
+
+  try { localStorage.setItem(key, JSON.stringify({ c: STATE.chapterIdx, p: found, o: off })); } catch (e) {}
+}
+
+function scrollRestore(chIdx) {
+  var key = scrollKey(), s = null;
+  if (!key) return false;
+  try { s = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) {}
+  if (!s || s.c !== chIdx || s.p < 0) return false;
+  var el = document.querySelectorAll('#readerBody .para')[s.p];
+  if (!el) return false;
+  var y = el.getBoundingClientRect().top + window.pageYOffset + s.o - (dockHeaderH() + 12);
+  SCROLLPOS.lock = Date.now() + 900;
+  window.scrollTo(0, Math.max(0, y));
+  setTimeout(dockUpdate, 50);
+  return true;
+}
+
+/* ---------- Gắn vào openChapter / showView ---------- */
+(function dockPatch() {
+  var _open = window.openChapter, _show = window.showView;
+
+  if (typeof _open === 'function') {
+    window.openChapter = function () {
+      SCROLLPOS.lock = Date.now() + 900;      // đang chuyển chương: tạm không ghi vị trí
+      var r = _open.apply(this, arguments);
+      dockRender();
+      dockSchedule();
+      setTimeout(scrollSave, 1000);
+      return r;
+    };
+  }
+  if (typeof _show === 'function') {
+    window.showView = function () {
+      var r = _show.apply(this, arguments);
+      dockSchedule();
+      return r;
+    };
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', dockInit);
+  else dockInit();
 })();
