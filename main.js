@@ -1611,3 +1611,80 @@ function scrollRestore(chIdx) {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', dockInit);
   else dockInit();
 })();
+
+/* =========================================================
+   PHÂN MỤC (cột G trong sheet): Hương Hoa / Hương Hỏa / Hương Đồng Gió Nội
+   - 3 mục hiện trên thanh điều hướng, mỗi mục là một trang riêng
+   ========================================================= */
+var CATEGORIES = [
+  {
+    key: 'huong-hoa', name: 'Hương Hoa',
+    icon: '<circle cx="12" cy="12" r="2.2"/><circle cx="12" cy="5.7" r="2.4"/><circle cx="18" cy="10.1" r="2.4"/><circle cx="15.7" cy="17.1" r="2.4"/><circle cx="8.3" cy="17.1" r="2.4"/><circle cx="6" cy="10.1" r="2.4"/>'
+  },
+  {
+    key: 'huong-hoa-lua', name: 'Hương Hỏa',
+    icon: '<path d="M12 2.5c.8 3.6 5.5 5.6 5.5 10.5a5.5 5.5 0 0 1-11 0c0-2.2 1-3.7 2.3-4.9.3 1.8 1 2.6 1.9 3 .2-3.2.6-5.8 1.3-8.6z"/>'
+  },
+  {
+    key: 'huong-dong-gio-noi', name: 'Hương Đồng Gió Nội',
+    icon: '<path d="M9.59 4.59A2 2 0 1 1 11 8H2m10.59 11.41A2 2 0 1 0 14 16H2m15.73-8.27A2.5 2.5 0 1 1 19.5 12H2"/>'
+  }
+];
+
+function catSvg(c, size) {
+  return '<svg class="icon" viewBox="0 0 24 24"' + (size ? ' style="width:' + size + 'px;height:' + size + 'px"' : '') + '>' + c.icon + '</svg>';
+}
+
+function catInit() {
+  var nav = document.getElementById('nav');
+  var prev = document.getElementById('view-books') || document.getElementById('view-home');
+  if (!nav || !prev || document.getElementById('view-' + CATEGORIES[0].key)) return;
+
+  var first = nav.firstElementChild;
+  var late = document.readyState !== 'loading';   // initNav đã chạy rồi thì tự gắn sự kiện bấm
+
+  CATEGORIES.forEach(function (c) {
+    var a = document.createElement('a');
+    a.href = '#';
+    a.setAttribute('data-view', c.key);
+    a.innerHTML = catSvg(c, 17) + ' ' + esc(c.name);
+    nav.insertBefore(a, first);
+    if (late) {
+      a.addEventListener('click', function (e) {
+        e.preventDefault();
+        showView(c.key);
+        if (typeof closeMobileMenu === 'function') closeMobileMenu();
+      });
+    }
+
+    var v = document.createElement('div');
+    v.className = 'view';
+    v.id = 'view-' + c.key;
+    v.innerHTML =
+      '<div class="section-head"><h2>' + catSvg(c) + ' ' + esc(c.name) + '</h2><div class="squiggle"></div></div>' +
+      '<div id="grid-' + c.key + '"><div class="loading-flowers"><span>✿</span><span>✿</span><span>✿</span></div></div>';
+    prev.insertAdjacentElement('afterend', v);
+    prev = v;
+  });
+}
+
+function catRender() {
+  CATEGORIES.forEach(function (c) {
+    var list = (STATE.books || []).filter(function (b) {
+      return (b.cats || []).indexOf(c.key) >= 0;
+    });
+    renderGrid('grid-' + c.key, list, 'Mục này chưa có sách nào, quay lại sau nhé ✿');
+  });
+}
+
+(function catPatch() {
+  catInit();
+  var _render = window.renderAllBookGrids;
+  if (typeof _render === 'function') {
+    window.renderAllBookGrids = function () {
+      var res = _render.apply(this, arguments);
+      catRender();
+      return res;
+    };
+  }
+})();
